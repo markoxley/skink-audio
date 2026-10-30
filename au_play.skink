@@ -1,0 +1,97 @@
+// File:    au_play.skink
+// Purpose: Subprocess playback for skink-audio. Encodes a Buffer to a
+//          temp WAV and shells out to the first available player
+//          (aplay, paplay, ffplay, afplay, or play/sox). No external
+//          libs — pure process plumbing via std/os.
+module au_play
+
+import "std/str"
+import "std/strconv"
+import "std/os"
+import "std/fs"
+import "std/rand"
+import "std/errors"
+import "au_pcm"
+import "au_wav"
+
+extern fn getpid() -> int
+
+// shellEsc wraps s in single quotes with embedded quotes escaped —
+// paths interpolated into os.System commands must pass through this.
+fn shellEsc(s: string) -> string {
+    out := "'"
+    n := str.Len(s)
+    for i := 0; i < n; i = i + 1 {
+        c := s[i]
+        if c == 39 {
+            out = str.Concat(out, "'\\''")
+        } else {
+            out = str.Concat(out, str.Substr(s, i, 1))
+        }
+    }
+    return str.Concat(out, "'")
+}
+
+// tmpName builds an unpredictable /tmp path (pid + random) so a
+// pre-created symlink can't redirect the write.
+fn tmpName(prefix: string, ext: string) -> string {
+    return str.Concat("/tmp/", str.Concat(prefix, str.Concat(strconv.Itoa(getpid()),
+        str.Concat("-", str.Concat(strconv.Itoa(rand.Int()), ext)))))
+}
+
+// playerDef is one candidate external player.
+struct playerDef {
+    name: string
+    args: string   // format with {} for the wav path
+}
+
+// players lists candidates tried in order (first hit wins).
+fn players() -> []playerDef {
+    var p []playerDef
+    p = append(p, playerDef{name: "aplay", args: "-q {}"})
+    p = append(p, playerDef{name: "paplay", args: "{}"})
+    p = append(p, playerDef{name: "ffplay", args: "-nodisp -autoexit -loglevel quiet {}"})
+    p = append(p, playerDef{name: "afplay", args: "{}"})
+    p = append(p, playerDef{name: "play", args: "-q {}"})
+    return p
+}
+
+// FindPlayer returns the name of an installed player, or "".
+pub fn FindPlayer() -> string {
+    ps := players()
+    for i := 0; i < len(ps); i = i + 1 {
+        out, _ := os.RunWithOutput(str.Concat("command -v ", ps[i].name))
+        if str.Len(str.Trim(out)) > 0 {
+            return ps[i].name
+        }
+    }
+    return ""
+}
+
+// PlayWavFile plays a WAV file through the detected player. Blocks
+// until playback finishes. Returns an error if no player exists.
+pub fn PlayWavFile(path: string) -> errors.Error {
+    ps := players()
+    for i := 0; i < len(ps); i = i + 1 {
+        out, _ := os.RunWithOutput(str.Concat("command -v ", ps[i].name))
+        if str.Len(str.Trim(out)) == 0 {
+            continue
+        }
+        cmd := str.Replace(ps[i].args, "{}", shellEsc(path))
+        os.System(str.Concat(ps[i].name, str.Concat(" ", cmd)))
+        return errors.New("")
+    }
+    return errors.New("audio: no player found (tried aplay, paplay, ffplay, afplay, play)")
+}
+
+// Play encodes a Buffer to a temp WAV and plays it. Blocks.
+pub fn Play(b: *au_pcm.Buffer) -> errors.Error {
+    path := tmpName("skink-audio-", ".wav")
+    werr := au_wav.Write(path, b)
+    if str.Len(werr.message) > 0 {
+        return werr
+    }
+    perr := PlayWavFile(path)
+    fs.Remove(path)
+    return perr
+}

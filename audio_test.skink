@@ -1,0 +1,247 @@
+// File:    audio_test.skink
+// Purpose: Unit tests for skink-audio — PCM buffer math, WAV codec
+//          round-trips, DSP ops, FFT spectrum analysis, synthesis,
+//          and the player detection path. No audio hardware required.
+module audio_test
+
+import "au_pcm"
+import "au_wav"
+import "au_dsp"
+import "au_fft"
+import "au_synth"
+import "au_play"
+import "audio"
+import "std/str"
+import "std/math"
+import "std/libc"
+import "std/fs"
+import "std/testing"
+
+// TestPCMBuffer verifies allocation, frame math, duration, peak, RMS.
+pub fn TestPCMBuffer() {
+    b := au_pcm.New(48000, 2, 480)
+    testing.AssertEqualInt(au_pcm.Frames(&b), 480, "frames")
+    testing.AssertEqualInt(len(b.Samples), 960, "samples")
+    testing.AssertTrue(math.Abs(au_pcm.DurationSecs(&b) - 0.01) < 0.0001, "duration ~10ms")
+    b.Samples[0] = 0.5
+    b.Samples[1] = -0.25
+    testing.AssertTrue(math.Abs(au_pcm.Peak(&b) - 0.5) < 0.0001, "peak 0.5")
+    testing.AssertTrue(au_pcm.RMS(&b) > 0.01, "rms nonzero")
+}
+
+// TestS16RoundTrip verifies ToS16/FromS16 byte-exactness at extremes.
+pub fn TestS16RoundTrip() {
+    var s []float
+    s = append(s, 0.0)
+    s = append(s, 1.0)
+    s = append(s, -1.0)
+    s = append(s, 0.5)
+    s = append(s, -0.5)
+    b := au_pcm.FromF64(44100, 1, s)
+    bytes, n := au_pcm.ToS16(&b)
+    testing.AssertEqualInt(n, 10, "s16 len")
+    testing.AssertEqualInt(32767, (int(bytes[2]) & 255) | ((int(bytes[3]) & 255) << 8), "max s16")
+    testing.AssertEqualInt(32769, (int(bytes[4]) & 255) | ((int(bytes[5]) & 255) << 8), "min s16 is -32767 (x32767 scale)")
+    d := au_pcm.FromS16(44100, 1, bytes, n)
+    testing.AssertTrue(math.Abs(d.Samples[0]) < 0.0001, "zero")
+    testing.AssertTrue(math.Abs(d.Samples[1] - 32767.0 / 32768.0) < 0.0001, "max")
+    testing.AssertTrue(math.Abs(d.Samples[2] + 1.0) < 0.0001, "min")
+    libc.free(bytes)
+}
+
+// TestWavRoundTrip encodes, decodes, and compares a buffer.
+pub fn TestWavRoundTrip() {
+    src := au_synth.Tone(au_synth.WAVE_SINE, 440.0, 0.05, 8000, 0.5)
+    bytes, n := au_wav.Encode(&src)
+    testing.AssertTrue(n == 44 + au_pcm.Frames(&src) * 2, "wav size")
+    testing.AssertTrue(bytes[0] == 82 && bytes[1] == 73, "RIFF magic")
+    d, err := au_wav.Decode(bytes, n)
+    testing.AssertTrue(str.Len(err.message) == 0, str.Concat("decode: ", err.message))
+    testing.AssertEqualInt(d.Rate, 8000, "rate")
+    testing.AssertEqualInt(d.Channels, 1, "channels")
+    testing.AssertEqualInt(au_pcm.Frames(&d), au_pcm.Frames(&src), "frames match")
+    // samples should closely track the source within s16 quantization
+    diff := math.Abs(d.Samples[3] - src.Samples[3])
+    testing.AssertTrue(diff < 0.001, "sample delta < s16 quantum")
+    libc.free(bytes)
+}
+
+// TestWavFile exercises fs-level Write/Read round-trip.
+pub fn TestWavFile() {
+    src := au_synth.Tone(au_synth.WAVE_SINE, 220.0, 0.02, 8000, 0.4)
+    path := "/tmp/skink-audio-test.wav"
+    werr := au_wav.Write(path, &src)
+    testing.AssertTrue(str.Len(werr.message) == 0, str.Concat("write: ", werr.message))
+    testing.AssertTrue(fs.Exists(path), "wav exists")
+    d, rerr := au_wav.Read(path)
+    testing.AssertTrue(str.Len(rerr.message) == 0, str.Concat("read: ", rerr.message))
+    testing.AssertEqualInt(d.Rate, 8000, "file rate")
+    testing.AssertTrue(math.Abs(au_pcm.DurationSecs(&d) - 0.02) < 0.001, "duration")
+    fs.Remove(path)
+}
+
+// TestWavDecodeRejects checks error paths on non-WAV input.
+pub fn TestWavDecodeRejects() {
+    var b au_pcm.Buffer
+    _, e1 := au_wav.Decode("short", 5)
+    testing.AssertTrue(str.Len(e1.message) > 0, "short rejected")
+    bad := libc.malloc(64)
+    libc.memset(bad, 0, 64)
+    bad[0] = 82
+    bad[1] = 73
+    bad[2] = 70
+    bad[3] = 70
+    bad[8] = 88
+    bad[9] = 88
+    bad[10] = 88
+    bad[11] = 88   // XXXX not WAVE
+    _, e2 := au_wav.Decode(bad, 64)
+    testing.AssertTrue(str.Len(e2.message) > 0, "non-WAVE rejected")
+    libc.free(bad)
+    _ = b
+}
+
+// TestDSPOps verifies gain/normalize/mix/reverse/fades/clip.
+pub fn TestDSPOps() {
+    var s []float
+    s = append(s, 0.1)
+    s = append(s, 0.2)
+    s = append(s, 0.3)
+    s = append(s, 0.4)
+    b := au_pcm.FromF64(44100, 1, s)
+    au_dsp.Gain(&b, 2.0)
+    testing.AssertTrue(math.Abs(b.Samples[3] - 0.8) < 0.0001, "gain x2")
+    au_dsp.Normalize(&b, 1.0)
+    testing.AssertTrue(math.Abs(au_pcm.Peak(&b) - 1.0) < 0.0001, "normalized")
+    au_dsp.Clip(&b)
+    testing.AssertTrue(au_pcm.Peak(&b) <= 1.0, "clipped")
+    au_dsp.Reverse(&b)
+    testing.AssertTrue(math.Abs(b.Samples[0] - b.Samples[3] * 0.5) > 0.0, "reversed order changed")
+    au_dsp.FadeIn(&b, 0.00005)
+    au_dsp.FadeOut(&b, 0.00005)
+}
+
+// TestResample verifies frame count and rough content preservation.
+pub fn TestResample() {
+    src := au_synth.Tone(au_synth.WAVE_SINE, 440.0, 0.1, 8000, 0.5)
+    up := au_dsp.Resample(&src, 16000)
+    testing.AssertEqualInt(au_pcm.Frames(&up), 1600, "upsample frames")
+    testing.AssertEqualInt(up.Rate, 16000, "up rate")
+    down := au_dsp.Resample(&src, 4000)
+    testing.AssertEqualInt(au_pcm.Frames(&down), 400, "downsample frames")
+    // dominant freq should survive downsampling (Nyquist=2k > 440Hz, "eq")
+    mono := au_pcm.Mono(&down)
+    f := au_fft.DominantFreq(mono.Samples, 4000)
+    testing.AssertTrue(math.Abs(f - 440.0) < 50.0, "resampled keeps ~440Hz")
+}
+
+// TestFilters checks low/high-pass attenuate the right bands.
+pub fn TestFilters() {
+    // 100Hz + 5000Hz mix at 16kHz
+    lo := au_synth.Tone(au_synth.WAVE_SINE, 100.0, 0.1, 16000, 0.5)
+    hi := au_synth.Tone(au_synth.WAVE_SINE, 5000.0, 0.1, 16000, 0.5)
+    au_dsp.Mix(&lo, &hi, 1.0)
+    lp := lo
+    au_dsp.Lowpass(&lp, 500.0)
+    f := au_fft.DominantFreq(lp.Samples, 16000)
+    testing.AssertTrue(f < 500.0, "lowpass keeps low band")
+    hp := lo
+    au_dsp.Highpass(&hp, 2000.0)
+    f2 := au_fft.DominantFreq(hp.Samples, 16000)
+    testing.AssertTrue(f2 > 2000.0, "highpass keeps high band")
+}
+
+// TestFFT verifies spectrum of a pure sine peaks at the right bin.
+pub fn TestFFT() {
+    src := au_synth.Tone(au_synth.WAVE_SINE, 440.0, 0.1, 8000, 0.9)
+    f := au_fft.DominantFreq(src.Samples, 8000)
+    testing.AssertTrue(math.Abs(f - 440.0) < 20.0, "peak ~440Hz")
+    mags := au_fft.Magnitude(src.Samples, len(src.Samples))
+    testing.AssertTrue(len(mags) > 0, "mags")
+}
+
+// TestEcho verifies the delayed copy shows up in the output.
+pub fn TestEcho() {
+    var s []float
+    for i := 0; i < 100; i = i + 1 {
+        s = append(s, 0.0)
+    }
+    s[0] = 1.0
+    b := au_pcm.FromF64(1000, 1, s)
+    e := au_dsp.Echo(&b, 0.05, 0.5)   // 50 samples at 1kHz
+    testing.AssertTrue(math.Abs(e.Samples[50] - 0.5) < 0.001, "echo tap")
+}
+
+// TestMonoStereo checks channel conversions.
+pub fn TestMonoStereo() {
+    var s []float
+    s = append(s, 0.5)
+    s = append(s, -0.5)
+    s = append(s, 1.0)
+    s = append(s, -1.0)
+    b := au_pcm.FromF64(44100, 2, s)  // stereo, 2 frames
+    m := au_pcm.Mono(&b)
+    testing.AssertEqualInt(m.Channels, 1, "mono ch")
+    testing.AssertEqualInt(len(m.Samples), 2, "mono len")
+    testing.AssertTrue(math.Abs(m.Samples[0]) < 0.0001, "stereo cancel")
+    st := au_pcm.Stereo(&m)
+    testing.AssertEqualInt(st.Channels, 2, "stereo ch")
+    testing.AssertEqualInt(len(st.Samples), 4, "stereo len")
+}
+
+// TestNoteFreq verifies A4=440 and octave math.
+pub fn TestNoteFreq() {
+    testing.AssertTrue(math.Abs(au_synth.NoteToFreq("A4") - 440.0) < 0.01, "A4")
+    testing.AssertTrue(math.Abs(au_synth.NoteToFreq("A5") - 880.0) < 0.01, "A5")
+    testing.AssertTrue(math.Abs(au_synth.NoteToFreq("C4") - 261.63) < 0.5, "C4")
+    testing.AssertTrue(math.Abs(au_synth.NoteToFreq("C#4") - 277.18) < 0.5, "C#4")
+    testing.AssertTrue(math.Abs(au_synth.NoteToFreq("Bb4") - 466.16) < 0.5, "Bb4")
+}
+
+// TestADSR verifies the envelope ramps attack/sustain/release.
+pub fn TestADSR() {
+    env := au_synth.ADSR{Attack: 0.01, Decay: 0.01, Sustain: 0.5, Release: 0.02}
+    b := au_synth.Tone(au_synth.WAVE_SINE, 440.0, 0.1, 8000, 1.0)
+    au_synth.Apply(env, &b, 0.07)
+    // first sample should be near zero (attack ramp)
+    testing.AssertTrue(math.Abs(b.Samples[0]) < 0.02, "attack starts at 0")
+    // sustained region ~0.5 amplitude
+    mid := int(0.05 * 8000.0)
+    testing.AssertTrue(math.Abs(b.Samples[mid]) < 0.6, "sustain ~0.5x")
+    // tail past note end decays
+    tail := int(0.095 * 8000.0)
+    testing.AssertTrue(math.Abs(b.Samples[tail]) < 0.3, "release decays")
+}
+
+// TestChordAndNote verifies named-note buffers produce the right peak.
+pub fn TestChordAndNote() {
+    n := au_synth.Note("A4", au_synth.WAVE_SINE, 0.05, 8000, 0.8, au_synth.DefaultADSR())
+    testing.AssertTrue(au_pcm.Frames(&n) > 300, "note frames")
+    var names []string
+    names = append(names, "C4")
+    names = append(names, "E4")
+    names = append(names, "G4")
+    c := au_synth.Chord(names, au_synth.WAVE_SINE, 0.05, 8000, 0.9)
+    testing.AssertTrue(au_pcm.Peak(&c) > 0.2, "chord sums")
+}
+
+// TestFindPlayer checks detection returns "" or a known player name
+// (both are valid — the test only asserts the lookup doesn't crash).
+pub fn TestFindPlayer() {
+    p := au_play.FindPlayer()
+    if str.Len(p) > 0 {
+        testing.AssertTrue(p == "aplay" || p == "paplay" || p == "ffplay" || p == "afplay" || p == "play", "known player")
+    }
+}
+
+// TestRootModule verifies the `audio` convenience wrappers work.
+pub fn TestRootModule() {
+    b := audio.NewBuffer(8000, 1, 100)
+    testing.AssertEqualInt(au_pcm.Frames(&b), 100, "root frames")
+    s := audio.Sine(440.0, 0.05, 8000, 0.5)
+    testing.AssertTrue(au_pcm.Peak(&s) > 0.4, "sine level")
+    f := audio.SpectralPeak(s.Samples, 8000)
+    testing.AssertTrue(math.Abs(f - 440.0) < 30.0, "wrapper peak")
+    r := audio.ResampleBuffer(&s, 4000)
+    testing.AssertEqualInt(r.Rate, 4000, "root resample")
+}

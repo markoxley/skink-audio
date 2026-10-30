@@ -1,0 +1,56 @@
+// File:    audio.skink
+// Purpose: Root module for skink-audio. Re-exports the package's
+//          sub-modules so `import "audio"` brings the whole API.
+//
+//          Layers:
+//            au_pcm   — interleaved float Buffer model + S16 codecs
+//            au_wav   — RIFF/WAVE PCM16 encode/decode + file IO
+//            au_dsp   — gain/mix/fade/echo/filters/resample
+//            au_fft   — radix-2 FFT spectrum analysis
+//            au_synth — oscillators, ADSR, notes, tones, chords
+//            au_play  — subprocess playback (aplay/ffplay/...)
+module audio
+
+import "au_pcm"
+import "au_wav"
+import "au_dsp"
+import "au_fft"
+import "au_synth"
+import "au_play"
+
+// PlayBuffer renders a Buffer through the detected system player.
+pub fn PlayBuffer(b: *au_pcm.Buffer) {
+    au_play.Play(b)
+}
+
+// NewBuffer allocates a zeroed PCM buffer.
+pub fn NewBuffer(rate: int, channels: int, frames: int) -> au_pcm.Buffer {
+    return au_pcm.New(rate, channels, frames)
+}
+
+// ReadWav decodes a WAV file into a Buffer.
+pub fn ReadWav(path: string) -> (au_pcm.Buffer, string) {
+    b, err := au_wav.Read(path)
+    return b, err.message
+}
+
+// WriteWav encodes a Buffer to a WAV file.
+pub fn WriteWav(path: string, b: *au_pcm.Buffer) -> string {
+    err := au_wav.Write(path, b)
+    return err.message
+}
+
+// ResampleBuffer converts a Buffer to a new sample rate.
+pub fn ResampleBuffer(b: *au_pcm.Buffer, newRate: int) -> au_pcm.Buffer {
+    return au_dsp.Resample(b, newRate)
+}
+
+// Sine is a shorthand for a sine tone.
+pub fn Sine(freq: float, durSecs: float, rate: int, level: float) -> au_pcm.Buffer {
+    return au_synth.Tone(au_synth.WAVE_SINE, freq, durSecs, rate, level)
+}
+
+// SpectralPeak returns the dominant frequency of a mono sample slice.
+pub fn SpectralPeak(samples: []float, rate: int) -> float {
+    return au_fft.DominantFreq(samples, rate)
+}

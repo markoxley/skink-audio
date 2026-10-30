@@ -1,0 +1,17 @@
+# Skink Project Manifest (managed by scales)
+
+[package]
+name = "audio"
+version = "0.1.0"
+author = "mark"
+entry = "audio.skink"
+description = "Audio processing for Skink: PCM buffers, WAV codec, DSP (resample/filters/mix), FFT spectrum analysis, oscillators + ADSR synthesis, and subprocess playback (aplay/paplay/ffplay/afplay)"
+license = "Apache-2.0"
+
+[target]
+env = "std"
+no_std = false
+os = "any"
+arch = "any"
+
+[dependencies]

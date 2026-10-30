@@ -1,0 +1,173 @@
+// File:    au_synth.skink
+// Purpose: Oscillators + envelopes + note helpers for skink-audio.
+//          Sine/square/saw/triangle/noise waveform generation at a
+//          given rate, an ADSR envelope, note-name → frequency, and
+//          Tone/Chord/Melody convenience constructors that emit
+//          au_pcm.Buffers ready for wav/play.
+module au_synth
+
+import "std/math"
+import "std/rand"
+import "std/str"
+import "au_pcm"
+
+// Waveform selectors.
+pub const WAVE_SINE     = 0
+pub const WAVE_SQUARE   = 1
+pub const WAVE_SAW      = 2
+pub const WAVE_TRIANGLE = 3
+pub const WAVE_NOISE    = 4
+
+// osc returns the raw oscillator value [-1,1] at phase t (cycles).
+fn osc(wave: int, t: float) -> float {
+    frac := t - math.Floor(t)
+    if wave == WAVE_SINE {
+        return math.Sin(2.0 * math.Pi * frac)
+    }
+    if wave == WAVE_SQUARE {
+        if frac < 0.5 {
+            return 1.0
+        }
+        return -1.0
+    }
+    if wave == WAVE_SAW {
+        return 2.0 * frac - 1.0
+    }
+    if wave == WAVE_TRIANGLE {
+        if frac < 0.5 {
+            return 4.0 * frac - 1.0
+        }
+        return 3.0 - 4.0 * frac
+    }
+    return rand.Float64() * 2.0 - 1.0
+}
+
+// ADSR is an attack/decay/sustain/release envelope (seconds + level).
+pub struct ADSR {
+    Attack:  float   // seconds to peak
+    Decay:   float   // seconds from peak to sustain level
+    Sustain: float   // sustain level 0..1
+    Release: float   // seconds from sustain to 0 after note end
+}
+
+// DefaultADSR is a gentle envelope (10ms attack, 100ms decay, 0.7
+// sustain, 200ms release).
+pub fn DefaultADSR() -> ADSR {
+    return ADSR{Attack: 0.01, Decay: 0.1, Sustain: 0.7, Release: 0.2}
+}
+
+// Apply multiplies an ADSR envelope into a mono buffer.
+// noteDur is the sustain duration; release extends past it.
+pub fn Apply(e: ADSR, b: *au_pcm.Buffer, noteDurSecs: float) {
+    fr := au_pcm.Frames(b)
+    sr := float(b.Rate)
+    attack := int(e.Attack * sr)
+    decay := int(e.Decay * sr)
+    sustain := int(noteDurSecs * sr)
+    for f := 0; f < fr; f = f + 1 {
+        k := 1.0
+        if f < attack && attack > 0 {
+            k = float(f) / float(attack)
+        } else if f < attack + decay && decay > 0 {
+            p := float(f - attack) / float(decay)
+            k = 1.0 - p * (1.0 - e.Sustain)
+        } else if f < sustain {
+            k = e.Sustain
+        } else {
+            // release
+            rel := int(e.Release * sr)
+            if rel > 0 {
+                p := float(f - sustain) / float(rel)
+                if p > 1.0 {
+                    p = 1.0
+                }
+                k = e.Sustain * (1.0 - p)
+            } else {
+                k = 0.0
+            }
+        }
+        for c := 0; c < b.Channels; c = c + 1 {
+            b.Samples[f * b.Channels + c] = b.Samples[f * b.Channels + c] * k
+        }
+    }
+}
+
+// NoteToFreq converts a note name to Hz. names like "A4", "C#5",
+// "Bb3". A4 = 440.
+pub fn NoteToFreq(name: string) -> float {
+    if str.Len(name) < 2 {
+        return 0.0
+    }
+    base := 0
+    c := name[0]
+    if c == 67 { base = 0 }        // C
+    if c == 68 { base = 2 }        // D
+    if c == 69 { base = 4 }        // E
+    if c == 70 { base = 5 }        // F
+    if c == 71 { base = 7 }        // G
+    if c == 65 { base = 9 }        // A
+    if c == 66 { base = 11 }       // B
+    i := 1
+    if i < str.Len(name) {
+        if name[i] == 35 {        // '#'
+            base = base + 1
+            i = i + 1
+        } else if name[i] == 98 { // 'b'
+            base = base - 1
+            i = i + 1
+        }
+    }
+    if i >= str.Len(name) {
+        return 0.0
+    }
+    oct := int(name[i]) - 48
+    // semitone distance from A4: note idx = oct*12 + base; A4=idx 57
+    dist := oct * 12 + base - 57
+    return 440.0 * math.Pow(2.0, float(dist) / 12.0)
+}
+
+// Tone renders a waveform at freq Hz for durSecs at rate Hz, mono.
+// level is the un-enveloped amplitude (0..1).
+pub fn Tone(wave: int, freq: float, durSecs: float, rate: int, level: float) -> au_pcm.Buffer {
+    fr := int(durSecs * float(rate))
+    var s []float
+    for f := 0; f < fr; f = f + 1 {
+        t := float(f) / float(rate) * freq
+        s = append(s, osc(wave, t) * level)
+    }
+    return au_pcm.Buffer{Rate: rate, Channels: 1, Samples: s}
+}
+
+// Note renders a named note with ADSR, mono. dur is the sustain time;
+// release extends the tail.
+pub fn Note(name: string, wave: int, durSecs: float, rate: int, level: float, env: ADSR) -> au_pcm.Buffer {
+    freq := NoteToFreq(name)
+    total := durSecs + env.Release
+    b := Tone(wave, freq, total, rate, level)
+    Apply(env, &b, durSecs)
+    return b
+}
+
+// Chord sums multiple named notes (all same duration/wave) into one
+// buffer.
+pub fn Chord(notes: []string, wave: int, durSecs: float, rate: int, level: float) -> au_pcm.Buffer {
+    var out au_pcm.Buffer
+    first := true
+    for i := 0; i < len(notes); i = i + 1 {
+        b := Tone(wave, NoteToFreq(notes[i]), durSecs, rate, level / float(len(notes)))
+        if first {
+            out = b
+            first = false
+        } else {
+            // in-place mix
+            n := len(out.Samples)
+            if len(b.Samples) < n {
+                n = len(b.Samples)
+            }
+            for k := 0; k < n; k = k + 1 {
+                out.Samples[k] = out.Samples[k] + b.Samples[k]
+            }
+        }
+    }
+    return out
+}

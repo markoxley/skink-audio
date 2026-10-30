@@ -1,0 +1,190 @@
+// File:    au_dsp.skink
+// Purpose: DSP operations for skink-audio on au_pcm.Buffer — gain,
+//          normalize, mix, fades, reverse, echo, one-pole low/high
+//          pass filters, and linear-interpolation resampling. All
+//          work on normalized float samples; clipping is the caller's
+//          choice (ToS16 clamps on encode anyway).
+module au_dsp
+
+import "std/math"
+import "au_pcm"
+
+// Gain scales every sample by `factor` in place.
+pub fn Gain(b: *au_pcm.Buffer, factor: float) {
+    for i := 0; i < len(b.Samples); i = i + 1 {
+        b.Samples[i] = b.Samples[i] * factor
+    }
+}
+
+// GainDb applies a decibel gain.
+pub fn GainDb(b: *au_pcm.Buffer, db: float) {
+    Gain(b, math.Pow(10.0, db / 20.0))
+}
+
+// Normalize scales the buffer so its peak equals `target`.
+pub fn Normalize(b: *au_pcm.Buffer, target: float) {
+    p := au_pcm.Peak(b)
+    if p > 0.0000001 {
+        Gain(b, target / p)
+    }
+}
+
+// Mix sums `other` into `b` at `level` (0..1). Rates and channel
+// counts must match; extra frames in `other` are ignored.
+pub fn Mix(b: *au_pcm.Buffer, other: *au_pcm.Buffer, level: float) {
+    n := len(b.Samples)
+    if len(other.Samples) < n {
+        n = len(other.Samples)
+    }
+    for i := 0; i < n; i = i + 1 {
+        b.Samples[i] = b.Samples[i] + other.Samples[i] * level
+    }
+}
+
+// Reverse reverses the sample order (per-channel aware — frames stay
+// intact).
+pub fn Reverse(b: *au_pcm.Buffer) {
+    fr := au_pcm.Frames(b)
+    ch := b.Channels
+    for f := 0; f < fr / 2; f = f + 1 {
+        for c := 0; c < ch; c = c + 1 {
+            a := f * ch + c
+            z := (fr - 1 - f) * ch + c
+            tmp := b.Samples[a]
+            b.Samples[a] = b.Samples[z]
+            b.Samples[z] = tmp
+        }
+    }
+}
+
+// FadeIn applies a linear ramp over the first `secs` seconds.
+pub fn FadeIn(b: *au_pcm.Buffer, secs: float) {
+    n := int(secs * float(b.Rate))
+    fr := au_pcm.Frames(b)
+    if n > fr {
+        n = fr
+    }
+    if n <= 0 {
+        return
+    }
+    for f := 0; f < n; f = f + 1 {
+        k := float(f) / float(n)
+        for c := 0; c < b.Channels; c = c + 1 {
+            b.Samples[f * b.Channels + c] = b.Samples[f * b.Channels + c] * k
+        }
+    }
+}
+
+// FadeOut applies a linear ramp over the last `secs` seconds.
+pub fn FadeOut(b: *au_pcm.Buffer, secs: float) {
+    n := int(secs * float(b.Rate))
+    fr := au_pcm.Frames(b)
+    if n > fr {
+        n = fr
+    }
+    for f := 0; f < n; f = f + 1 {
+        k := 1.0 - float(f) / float(n)
+        fr2 := fr - n + f
+        for c := 0; c < b.Channels; c = c + 1 {
+            b.Samples[fr2 * b.Channels + c] = b.Samples[fr2 * b.Channels + c] * k
+        }
+    }
+}
+
+// Echo mixes a delayed copy at `decay` gain. Returns a new buffer.
+pub fn Echo(b: *au_pcm.Buffer, delaySecs: float, decay: float) -> au_pcm.Buffer {
+    delayFrames := int(delaySecs * float(b.Rate))
+    fr := au_pcm.Frames(b)
+    var s []float
+    for i := 0; i < len(b.Samples); i = i + 1 {
+        s = append(s, b.Samples[i])
+    }
+    for f := delayFrames; f < fr; f = f + 1 {
+        for c := 0; c < b.Channels; c = c + 1 {
+            idx := f * b.Channels + c
+            s[idx] = s[idx] + b.Samples[idx - delayFrames * b.Channels] * decay
+        }
+    }
+    return au_pcm.Buffer{Rate: b.Rate, Channels: b.Channels, Samples: s}
+}
+
+// Lowpass applies a one-pole RC low-pass with cutoff in Hz.
+pub fn Lowpass(b: *au_pcm.Buffer, cutoffHz: float) {
+    rc := 1.0 / (2.0 * math.Pi * cutoffHz)
+    dt := 1.0 / float(b.Rate)
+    alpha := dt / (rc + dt)
+    ch := b.Channels
+    fr := au_pcm.Frames(b)
+    for c := 0; c < ch; c = c + 1 {
+        prev := b.Samples[c]
+        for f := 0; f < fr; f = f + 1 {
+            idx := f * ch + c
+            prev = prev + alpha * (b.Samples[idx] - prev)
+            b.Samples[idx] = prev
+        }
+    }
+}
+
+// Highpass applies a one-pole RC high-pass with cutoff in Hz.
+pub fn Highpass(b: *au_pcm.Buffer, cutoffHz: float) {
+    rc := 1.0 / (2.0 * math.Pi * cutoffHz)
+    dt := 1.0 / float(b.Rate)
+    alpha := rc / (rc + dt)
+    ch := b.Channels
+    fr := au_pcm.Frames(b)
+    for c := 0; c < ch; c = c + 1 {
+        prevX := b.Samples[c]
+        prevY := 0.0
+        for f := 0; f < fr; f = f + 1 {
+            idx := f * ch + c
+            x := b.Samples[idx]
+            y := alpha * (prevY + x - prevX)
+            b.Samples[idx] = y
+            prevX = x
+            prevY = y
+        }
+    }
+}
+
+// Resample converts to `newRate` via linear interpolation. Channel
+// count is preserved.
+pub fn Resample(b: *au_pcm.Buffer, newRate: int) -> au_pcm.Buffer {
+    if newRate <= 0 || b.Rate <= 0 || newRate == b.Rate {
+        return *b
+    }
+    ch := b.Channels
+    fr := au_pcm.Frames(b)
+    newFr := int(float(fr) * float(newRate) / float(b.Rate))
+    var s []float
+    for i := 0; i < newFr * ch; i = i + 1 {
+        s = append(s, 0.0)
+    }
+    ratio := float(b.Rate) / float(newRate)
+    for f := 0; f < newFr; f = f + 1 {
+        src := float(f) * ratio
+        i0 := int(src)
+        frac := src - float(i0)
+        i1 := i0 + 1
+        if i1 >= fr {
+            i1 = fr - 1
+        }
+        for c := 0; c < ch; c = c + 1 {
+            a := b.Samples[i0 * ch + c]
+            z := b.Samples[i1 * ch + c]
+            s[f * ch + c] = a + (z - a) * frac
+        }
+    }
+    return au_pcm.Buffer{Rate: newRate, Channels: ch, Samples: s}
+}
+
+// Clip hard-clamps samples to [-1, 1] in place.
+pub fn Clip(b: *au_pcm.Buffer) {
+    for i := 0; i < len(b.Samples); i = i + 1 {
+        if b.Samples[i] > 1.0 {
+            b.Samples[i] = 1.0
+        }
+        if b.Samples[i] < -1.0 {
+            b.Samples[i] = -1.0
+        }
+    }
+}

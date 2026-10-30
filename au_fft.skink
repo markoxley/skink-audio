@@ -1,0 +1,139 @@
+// File:    au_fft.skink
+// Purpose: Radix-2 FFT for skink-audio — spectrum analysis. Forward
+//          and inverse transforms over interleaved re/im arrays;
+//          Magnitude gives the power spectrum; DominantFreq finds the
+//          strongest bin. Inputs are padded to the next power of two.
+module au_fft
+
+import "std/math"
+import "std/libc"
+
+// fft is the iterative in-place Cooley–Tukey transform. inverse=true
+// runs the IFFT (no 1/N scaling — callers normalize if needed).
+fn fft(re: string, im: string, n: int, inverse: bool) {
+    // bit-reversal permutation
+    j := 0
+    for i := 1; i < n; i = i + 1 {
+        bit := n >> 1
+        for (j & bit) != 0 {
+            j = j ^ bit
+            bit = bit >> 1
+        }
+        j = j ^ bit
+        if i < j {
+            swapF64(re, i, j)
+            swapF64(im, i, j)
+        }
+    }
+    // butterflies
+    length := 2
+    for length <= n {
+        ang := 2.0 * math.Pi / float(length)
+        if inverse {
+            ang = -ang
+        }
+        wr := math.Cos(ang)
+        wi := math.Sin(ang)
+        i := 0
+        for i < n {
+            curWr := 1.0
+            curWi := 0.0
+            for k := 0; k < length / 2; k = k + 1 {
+                a := i + k
+                b2 := i + k + length / 2
+                tr := getF64(re, b2) * curWr - getF64(im, b2) * curWi
+                ti := getF64(re, b2) * curWi + getF64(im, b2) * curWr
+                setF64(re, b2, getF64(re, a) - tr)
+                setF64(im, b2, getF64(im, a) - ti)
+                setF64(re, a, getF64(re, a) + tr)
+                setF64(im, a, getF64(im, a) + ti)
+                nw := curWr * wr - curWi * wi
+                curWi = curWr * wi + curWi * wr
+                curWr = nw
+            }
+            i = i + length
+        }
+        length = length * 2
+    }
+}
+
+// getF64/setF64/swapF64 treat a malloc'd buffer as []float64.
+fn getF64(buf: string, i: int) -> float {
+    var f float
+    libc.memcpy(&f, string(int64(buf) + int64(i * 8)), 8)
+    return f
+}
+
+fn setF64(buf: string, i: int, v: float) {
+    libc.memcpy(string(int64(buf) + int64(i * 8)), &v, 8)
+}
+
+fn swapF64(buf: string, a: int, b: int) {
+    x := getF64(buf, a)
+    setF64(buf, a, getF64(buf, b))
+    setF64(buf, b, x)
+}
+
+// Pow2Ceil rounds up to the next power of two (min 1).
+pub fn Pow2Ceil(n: int) -> int {
+    p := 1
+    for p < n {
+        p = p * 2
+    }
+    return p
+}
+
+// Forward transforms samples (real input) into magnitude spectrum.
+// Returns magnitudes[0..n/2) — the positive-frequency half.
+// samples is zero-padded to the next power of two.
+pub fn Magnitude(samples: []float, n: int) -> []float {
+    n2 := Pow2Ceil(n)
+    re := libc.calloc(n2, 8)
+    im := libc.calloc(n2, 8)
+    for i := 0; i < n; i = i + 1 {
+        setF64(re, i, samples[i])
+    }
+    fft(re, im, n2, false)
+    var out []float
+    for i := 0; i < n2 / 2; i = i + 1 {
+        rr := getF64(re, i)
+        ii := getF64(im, i)
+        out = append(out, math.Sqrt(rr * rr + ii * ii))
+    }
+    libc.free(re)
+    libc.free(im)
+    return out
+}
+
+// DominantFreq returns the frequency (Hz) of the strongest spectral
+// bin of `samples` at `rate`. Returns 0 for silence.
+pub fn DominantFreq(samples: []float, rate: int) -> float {
+    n := len(samples)
+    if n == 0 {
+        return 0.0
+    }
+    mags := Magnitude(samples, n)
+    n2 := Pow2Ceil(n)
+    best := 0.0
+    bi := 0
+    for i := 1; i < len(mags); i = i + 1 {
+        if mags[i] > best {
+            best = mags[i]
+            bi = i
+        }
+    }
+    return float(bi) * float(rate) / float(n2)
+}
+
+// WindowHann applies a Hann window to samples in place (reduces
+// spectral leakage before Magnitude).
+pub fn WindowHann(samples: []float) {
+    n := len(samples)
+    if n <= 1 {
+        return
+    }
+    for i := 0; i < n; i = i + 1 {
+        w := 0.5 * (1.0 - math.Cos(2.0 * math.Pi * float(i) / float(n - 1)))
+        samples[i] = samples[i] * w
+    }
+}

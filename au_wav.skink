@@ -1,0 +1,155 @@
+// File:    au_wav.skink
+// Purpose: WAV (RIFF/WAVE PCM16) codec for skink-audio. Encode writes
+//          a canonical 44-byte header + PCM16 data; Decode parses
+//          RIFF/WAVE fmt/data chunks tolerantly (extra chunks skipped,
+//          fmt sizes >16 handled). File IO uses File.Write/Read with
+//          explicit lengths — binary-safe.
+module au_wav
+
+import "std/str"
+import "std/errors"
+import "std/fs"
+import "std/libc"
+import "au_pcm"
+
+// Encode renders a Buffer as a complete WAV file image (malloc'd —
+// caller frees). Returns (bytes, len).
+pub fn Encode(b: *au_pcm.Buffer) -> (string, int) {
+    pcm, pcmLen := au_pcm.ToS16(b)
+    total := 44 + pcmLen
+    out := libc.malloc(total)
+
+    // RIFF header
+    libc.memcpy(out, "RIFF", 4)
+    w32(out, 4, total - 8)
+    libc.memcpy(string(int64(out) + 8), "WAVE", 4)
+
+    // fmt chunk (PCM16)
+    libc.memcpy(string(int64(out) + 12), "fmt ", 4)
+    w32(out, 16, 16)                      // fmt size
+    w16(out, 20, 1)                       // audio format = PCM
+    w16(out, 22, b.Channels)
+    w32(out, 24, b.Rate)
+    w32(out, 28, b.Rate * b.Channels * 2) // byte rate
+    w16(out, 32, b.Channels * 2)          // block align
+    w16(out, 34, 16)                      // bits per sample
+
+    // data chunk
+    libc.memcpy(string(int64(out) + 36), "data", 4)
+    w32(out, 40, pcmLen)
+    libc.memcpy(string(int64(out) + 44), pcm, pcmLen)
+    libc.free(pcm)
+    return out, total
+}
+
+// Decode parses a WAV image into a Buffer. Supports PCM16 mono/stereo;
+// skips unknown chunks and fmt extensions.
+pub fn Decode(data: string, byteLen: int) -> (au_pcm.Buffer, errors.Error) {
+    var empty au_pcm.Buffer
+    if byteLen < 44 {
+        return empty, errors.New("wav: too short")
+    }
+    // byte-compare: Substr clamps by strlen and headers contain NULs
+    if data[0] != 82 || data[1] != 73 || data[2] != 70 || data[3] != 70 ||
+        data[8] != 87 || data[9] != 65 || data[10] != 86 || data[11] != 69 {
+        return empty, errors.New("wav: not RIFF/WAVE")
+    }
+    pos := 12
+    rate := 0
+    ch := 0
+    bits := 0
+    fmtSeen := false
+    for pos + 8 <= byteLen {
+        sz := r32(data, pos + 4)
+        idIsFmt := data[pos] == 102 && data[pos + 1] == 109 && data[pos + 2] == 116 && data[pos + 3] == 32
+        idIsData := data[pos] == 100 && data[pos + 1] == 97 && data[pos + 2] == 116 && data[pos + 3] == 97
+        if idIsFmt {
+            if sz < 16 || pos + 8 + sz > byteLen {
+                return empty, errors.New("wav: bad fmt chunk")
+            }
+            audioFmt := r16(data, pos + 8)
+            if audioFmt != 1 {
+                return empty, errors.New("wav: only PCM supported")
+            }
+            ch = r16(data, pos + 10)
+            rate = r32(data, pos + 12)
+            bits = r16(data, pos + 22)
+            fmtSeen = true
+        }
+        if idIsData {
+            if !fmtSeen {
+                return empty, errors.New("wav: data before fmt")
+            }
+            if bits != 16 {
+                return empty, errors.New("wav: only 16-bit PCM supported")
+            }
+            avail := byteLen - pos - 8
+            n := sz
+            if n > avail {
+                n = avail
+            }
+            return au_pcm.FromS16(rate, ch, string(int64(data) + int64(pos) + 8), n), errors.New("")
+        }
+        pos = pos + 8 + sz + (sz & 1)   // chunks are word-aligned
+    }
+    return empty, errors.New("wav: no data chunk")
+}
+
+// Write encodes + writes a WAV file.
+pub fn Write(path: string, b: *au_pcm.Buffer) -> errors.Error {
+    bytes, n := Encode(b)
+    f, err := fs.Open(path, "wb")
+    if str.Len(err.message) > 0 {
+        libc.free(bytes)
+        return err
+    }
+    f.Write(bytes, n)
+    f.Close()
+    libc.free(bytes)
+    return errors.New("")
+}
+
+// Read reads + decodes a WAV file.
+pub fn Read(path: string) -> (au_pcm.Buffer, errors.Error) {
+    var empty au_pcm.Buffer
+    f, err := fs.Open(path, "rb")
+    if str.Len(err.message) > 0 {
+        return empty, err
+    }
+    size := int(fs.FileSize(path))
+    data := libc.malloc(size + 1)
+    got := 0
+    for got < size {
+        n := f.Read(string(int64(data) + int64(got)), size - got)
+        if n <= 0 {
+            break
+        }
+        got = got + n
+    }
+    f.Close()
+    b, derr := Decode(data, got)
+    libc.free(data)
+    return b, derr
+}
+
+// w16/w32 write little-endian ints into a byte buffer.
+fn w16(buf: string, off: int, v: int) {
+    buf[off] = v & 255
+    buf[off + 1] = (v >> 8) & 255
+}
+
+fn w32(buf: string, off: int, v: int) {
+    buf[off] = v & 255
+    buf[off + 1] = (v >> 8) & 255
+    buf[off + 2] = (v >> 16) & 255
+    buf[off + 3] = (v >> 24) & 255
+}
+
+fn r16(buf: string, off: int) -> int {
+    return (int(buf[off]) & 255) | ((int(buf[off + 1]) & 255) << 8)
+}
+
+fn r32(buf: string, off: int) -> int {
+    return (int(buf[off]) & 255) | ((int(buf[off + 1]) & 255) << 8) |
+        ((int(buf[off + 2]) & 255) << 16) | ((int(buf[off + 3]) & 255) << 24)
+}
