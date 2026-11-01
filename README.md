@@ -14,10 +14,10 @@ scales add markoxley/skink-audio
 ## Quick start
 
 ```skink
-import "au_pcm"
-import "au_synth"
-import "au_wav"
-import "au_play"
+import "mod/markoxley/skink-audio/au_pcm"
+import "mod/markoxley/skink-audio/au_synth"
+import "mod/markoxley/skink-audio/au_wav"
+import "mod/markoxley/skink-audio/au_play"
 
 // synthesize a 440Hz sine, 1 second, 16kHz mono
 b := au_synth.Tone(au_synth.WAVE_SINE, 440.0, 1.0, 16000, 0.8)
