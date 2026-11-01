@@ -17,6 +17,12 @@ import "std/libc"
 import "std/fs"
 import "std/testing"
 
+// Raw byte accessors for malloc'd codec buffers — string indexing is
+// bounds-checked against strlen, which truncates at the first NUL byte
+// inside binary data.
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // TestPCMBuffer verifies allocation, frame math, duration, peak, RMS.
 pub fn TestPCMBuffer() {
     b := au_pcm.New(48000, 2, 480)
@@ -40,8 +46,8 @@ pub fn TestS16RoundTrip() {
     b := au_pcm.FromF64(44100, 1, s)
     bytes, n := au_pcm.ToS16(&b)
     testing.AssertEqualInt(n, 10, "s16 len")
-    testing.AssertEqualInt(32767, (int(bytes[2]) & 255) | ((int(bytes[3]) & 255) << 8), "max s16")
-    testing.AssertEqualInt(32769, (int(bytes[4]) & 255) | ((int(bytes[5]) & 255) << 8), "min s16 is -32767 (x32767 scale)")
+    testing.AssertEqualInt(32767, (Skink_mem_byte(bytes, 2) & 255) | ((Skink_mem_byte(bytes, 3) & 255) << 8), "max s16")
+    testing.AssertEqualInt(32769, (Skink_mem_byte(bytes, 4) & 255) | ((Skink_mem_byte(bytes, 5) & 255) << 8), "min s16 is -32767 (x32767 scale)")
     d := au_pcm.FromS16(44100, 1, bytes, n)
     testing.AssertTrue(math.Abs(d.Samples[0]) < 0.0001, "zero")
     testing.AssertTrue(math.Abs(d.Samples[1] - 32767.0 / 32768.0) < 0.0001, "max")
@@ -54,7 +60,7 @@ pub fn TestWavRoundTrip() {
     src := au_synth.Tone(au_synth.WAVE_SINE, 440.0, 0.05, 8000, 0.5)
     bytes, n := au_wav.Encode(&src)
     testing.AssertTrue(n == 44 + au_pcm.Frames(&src) * 2, "wav size")
-    testing.AssertTrue(bytes[0] == 82 && bytes[1] == 73, "RIFF magic")
+    testing.AssertTrue(Skink_mem_byte(bytes, 0) == 82 && Skink_mem_byte(bytes, 1) == 73, "RIFF magic")
     d, err := au_wav.Decode(bytes, n)
     testing.AssertTrue(str.Len(err.message) == 0, str.Concat("decode: ", err.message))
     testing.AssertEqualInt(d.Rate, 8000, "rate")
@@ -87,14 +93,14 @@ pub fn TestWavDecodeRejects() {
     testing.AssertTrue(str.Len(e1.message) > 0, "short rejected")
     bad := libc.malloc(64)
     libc.memset(bad, 0, 64)
-    bad[0] = 82
-    bad[1] = 73
-    bad[2] = 70
-    bad[3] = 70
-    bad[8] = 88
-    bad[9] = 88
-    bad[10] = 88
-    bad[11] = 88   // XXXX not WAVE
+    Skink_mem_write_byte(bad, 0, 82)
+    Skink_mem_write_byte(bad, 1, 73)
+    Skink_mem_write_byte(bad, 2, 70)
+    Skink_mem_write_byte(bad, 3, 70)
+    Skink_mem_write_byte(bad, 8, 88)
+    Skink_mem_write_byte(bad, 9, 88)
+    Skink_mem_write_byte(bad, 10, 88)
+    Skink_mem_write_byte(bad, 11, 88)   // XXXX not WAVE
     _, e2 := au_wav.Decode(bad, 64)
     testing.AssertTrue(str.Len(e2.message) > 0, "non-WAVE rejected")
     libc.free(bad)
@@ -244,4 +250,85 @@ pub fn TestRootModule() {
     testing.AssertTrue(math.Abs(f - 440.0) < 30.0, "wrapper peak")
     r := audio.ResampleBuffer(&s, 4000)
     testing.AssertEqualInt(r.Rate, 4000, "root resample")
+}
+
+// TestGainDb verifies decibel gain: +6.0206dB doubles the amplitude and
+// -6.0206dB halves it.
+pub fn TestGainDb() {
+    var s []float
+    s = append(s, 0.25)
+    s = append(s, -0.25)
+    b := au_pcm.FromF64(44100, 1, s)
+    au_dsp.GainDb(&b, 6.020599913279624)
+    testing.AssertTrue(math.Abs(b.Samples[0] - 0.5) < 0.001, "+6dB ~x2")
+    au_dsp.GainDb(&b, -6.020599913279624)
+    testing.AssertTrue(math.Abs(b.Samples[0] - 0.25) < 0.001, "-6dB restores")
+    au_dsp.GainDb(&b, 0.0)
+    testing.AssertTrue(math.Abs(b.Samples[0] - 0.25) < 0.0001, "0dB no-op")
+}
+
+// TestPow2Ceil checks next-power-of-two rounding at boundaries.
+pub fn TestPow2Ceil() {
+    testing.AssertEqualInt(1, au_fft.Pow2Ceil(0), "0 -> 1")
+    testing.AssertEqualInt(1, au_fft.Pow2Ceil(1), "1 -> 1")
+    testing.AssertEqualInt(8, au_fft.Pow2Ceil(5), "5 -> 8")
+    testing.AssertEqualInt(8, au_fft.Pow2Ceil(8), "8 -> 8")
+    testing.AssertEqualInt(1024, au_fft.Pow2Ceil(1000), "1000 -> 1024")
+    testing.AssertEqualInt(1024, au_fft.Pow2Ceil(1024), "1024 -> 1024")
+}
+
+// TestWindowHann verifies the Hann taper zeroes the ends and keeps the
+// centre, and that degenerate inputs don't panic.
+pub fn TestWindowHann() {
+    var s []float
+    for i := 0; i < 8; i = i + 1 {
+        s = append(s, 1.0)
+    }
+    au_fft.WindowHann(s)
+    testing.AssertTrue(math.Abs(s[0]) < 0.0001, "hann start ~0")
+    testing.AssertTrue(math.Abs(s[7]) < 0.0001, "hann end ~0")
+    testing.AssertTrue(math.Abs(s[3] - 1.0) < 0.2 || math.Abs(s[4] - 1.0) < 0.2, "hann centre ~1")
+    var one []float
+    one = append(one, 3.0)
+    au_fft.WindowHann(one)
+    testing.AssertTrue(math.Abs(one[0] - 3.0) < 0.0001, "len-1 unchanged")
+    var empty []float
+    au_fft.WindowHann(empty)
+    testing.AssertEqualInt(0, len(empty), "empty stays empty")
+}
+
+// TestRootWavRoundTrip exercises the audio.WriteWav/ReadWav wrappers.
+pub fn TestRootWavRoundTrip() {
+    src := audio.Sine(330.0, 0.02, 8000, 0.5)
+    path := "/tmp/skink-audio-root.wav"
+    werr := audio.WriteWav(path, &src)
+    testing.AssertEqualString("", werr, "WriteWav error")
+    d, rerr := audio.ReadWav(path)
+    testing.AssertEqualString("", rerr, "ReadWav error")
+    testing.AssertEqualInt(d.Rate, 8000, "root wav rate")
+    testing.AssertTrue(au_pcm.Frames(&d) == au_pcm.Frames(&src), "root wav frames")
+    _, missing := audio.ReadWav("/tmp/skink-audio-does-not-exist.wav")
+    testing.AssertTrue(str.Len(missing) > 0, "missing file errors")
+    fs.Remove(path)
+}
+
+// TestPlayPaths exercises the subprocess playback entry points. When no
+// player is installed both calls must return the "no player" error; when
+// one is installed (e.g. CI images with aplay) they return success without
+// blocking on real audio hardware — aplay exits quickly on a dummy device.
+pub fn TestPlayPaths() {
+    hasPlayer := str.Len(au_play.FindPlayer()) > 0
+    src := audio.Sine(440.0, 0.005, 8000, 0.3)
+    perr := au_play.Play(&src)
+    werr := au_play.PlayWavFile("/tmp/nonexistent-skink-audio.wav")
+    if hasPlayer {
+        testing.AssertEqualString("", perr.message, "Play succeeds when a player exists")
+        testing.AssertEqualString("", werr.message, "PlayWavFile succeeds when a player exists")
+    } else {
+        testing.AssertTrue(str.Len(perr.message) > 0, "Play errors without a player")
+        testing.AssertTrue(str.Len(werr.message) > 0, "PlayWavFile errors without a player")
+        testing.AssertContains(perr.message, "no player", "error names the failure")
+    }
+    // PlayBuffer is fire-and-forget — reaching here without a crash is the test.
+    audio.PlayBuffer(&src)
 }

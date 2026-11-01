@@ -8,6 +8,12 @@ module au_pcm
 import "std/math"
 import "std/libc"
 
+// Raw byte accessors for malloc'd buffers — string indexing is bounds-
+// checked against strlen, which is meaningless on a buffer that is still
+// being written (the first NUL byte would truncate the apparent length).
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // Buffer is an interleaved float64 PCM buffer.
 pub struct Buffer {
     Rate:     int       // samples per second per channel
@@ -70,8 +76,8 @@ pub fn ToS16(b: *Buffer) -> (string, int) {
         if u < 0 {
             u = u + 65536
         }
-        out[i * 2] = u & 255
-        out[i * 2 + 1] = (u >> 8) & 255
+        Skink_mem_write_byte(out, int64(i * 2), u & 255)
+        Skink_mem_write_byte(out, int64(i * 2 + 1), (u >> 8) & 255)
     }
     return out, n * 2
 }
@@ -81,8 +87,8 @@ pub fn FromS16(rate: int, channels: int, data: string, byteLen: int) -> Buffer {
     n := byteLen / 2
     var s []float
     for i := 0; i < n; i = i + 1 {
-        lo := int(data[i * 2]) & 255
-        hi := int(data[i * 2 + 1]) & 255
+        lo := Skink_mem_byte(data, int64(i * 2)) & 255
+        hi := Skink_mem_byte(data, int64(i * 2 + 1)) & 255
         v := lo | (hi << 8)
         if v >= 32768 {
             v = v - 65536

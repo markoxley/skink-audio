@@ -12,6 +12,12 @@ import "std/fs"
 import "std/libc"
 import "au_pcm"
 
+// Raw byte accessors for malloc'd buffers — string indexing is bounds-
+// checked against strlen, which truncates at the first NUL byte and so
+// cannot address positions inside a WAV image (headers are full of NULs).
+extern fn Skink_mem_byte(ptr: string, idx: int64) -> int
+extern fn Skink_mem_write_byte(ptr: string, idx: int64, val: int)
+
 // Encode renders a Buffer as a complete WAV file image (malloc'd —
 // caller frees). Returns (bytes, len).
 pub fn Encode(b: *au_pcm.Buffer) -> (string, int) {
@@ -50,8 +56,10 @@ pub fn Decode(data: string, byteLen: int) -> (au_pcm.Buffer, errors.Error) {
         return empty, errors.New("wav: too short")
     }
     // byte-compare: Substr clamps by strlen and headers contain NULs
-    if data[0] != 82 || data[1] != 73 || data[2] != 70 || data[3] != 70 ||
-        data[8] != 87 || data[9] != 65 || data[10] != 86 || data[11] != 69 {
+    if Skink_mem_byte(data, 0) != 82 || Skink_mem_byte(data, 1) != 73 ||
+        Skink_mem_byte(data, 2) != 70 || Skink_mem_byte(data, 3) != 70 ||
+        Skink_mem_byte(data, 8) != 87 || Skink_mem_byte(data, 9) != 65 ||
+        Skink_mem_byte(data, 10) != 86 || Skink_mem_byte(data, 11) != 69 {
         return empty, errors.New("wav: not RIFF/WAVE")
     }
     pos := 12
@@ -61,8 +69,8 @@ pub fn Decode(data: string, byteLen: int) -> (au_pcm.Buffer, errors.Error) {
     fmtSeen := false
     for pos + 8 <= byteLen {
         sz := r32(data, pos + 4)
-        idIsFmt := data[pos] == 102 && data[pos + 1] == 109 && data[pos + 2] == 116 && data[pos + 3] == 32
-        idIsData := data[pos] == 100 && data[pos + 1] == 97 && data[pos + 2] == 116 && data[pos + 3] == 97
+        idIsFmt := Skink_mem_byte(data, int64(pos)) == 102 && Skink_mem_byte(data, int64(pos + 1)) == 109 && Skink_mem_byte(data, int64(pos + 2)) == 116 && Skink_mem_byte(data, int64(pos + 3)) == 32
+        idIsData := Skink_mem_byte(data, int64(pos)) == 100 && Skink_mem_byte(data, int64(pos + 1)) == 97 && Skink_mem_byte(data, int64(pos + 2)) == 116 && Skink_mem_byte(data, int64(pos + 3)) == 97
         if idIsFmt {
             if sz < 16 || pos + 8 + sz > byteLen {
                 return empty, errors.New("wav: bad fmt chunk")
@@ -134,22 +142,22 @@ pub fn Read(path: string) -> (au_pcm.Buffer, errors.Error) {
 
 // w16/w32 write little-endian ints into a byte buffer.
 fn w16(buf: string, off: int, v: int) {
-    buf[off] = v & 255
-    buf[off + 1] = (v >> 8) & 255
+    Skink_mem_write_byte(buf, int64(off), v & 255)
+    Skink_mem_write_byte(buf, int64(off + 1), (v >> 8) & 255)
 }
 
 fn w32(buf: string, off: int, v: int) {
-    buf[off] = v & 255
-    buf[off + 1] = (v >> 8) & 255
-    buf[off + 2] = (v >> 16) & 255
-    buf[off + 3] = (v >> 24) & 255
+    Skink_mem_write_byte(buf, int64(off), v & 255)
+    Skink_mem_write_byte(buf, int64(off + 1), (v >> 8) & 255)
+    Skink_mem_write_byte(buf, int64(off + 2), (v >> 16) & 255)
+    Skink_mem_write_byte(buf, int64(off + 3), (v >> 24) & 255)
 }
 
 fn r16(buf: string, off: int) -> int {
-    return (int(buf[off]) & 255) | ((int(buf[off + 1]) & 255) << 8)
+    return (Skink_mem_byte(buf, int64(off)) & 255) | ((Skink_mem_byte(buf, int64(off + 1)) & 255) << 8)
 }
 
 fn r32(buf: string, off: int) -> int {
-    return (int(buf[off]) & 255) | ((int(buf[off + 1]) & 255) << 8) |
-        ((int(buf[off + 2]) & 255) << 16) | ((int(buf[off + 3]) & 255) << 24)
+    return (Skink_mem_byte(buf, int64(off)) & 255) | ((Skink_mem_byte(buf, int64(off + 1)) & 255) << 8) |
+        ((Skink_mem_byte(buf, int64(off + 2)) & 255) << 16) | ((Skink_mem_byte(buf, int64(off + 3)) & 255) << 24)
 }
